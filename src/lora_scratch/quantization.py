@@ -1,220 +1,296 @@
 """
 Quantization — 4-bit weight compression for the frozen base.
 
-Two schemes implemented:
-  1. Block-wise Absmax: simple 16-level symmetric quantization (baseline)
-  2. NF4 (Normal Float 4-bit): levels placed at normal-distribution quantiles
-     (INNOVATION — the scheme from the QLoRA paper, implemented from scratch)
+Two schemes:
+  1. Block-wise Absmax with real nibble packing (from lora-forge):
+     - Signed 4-bit values packed two-per-byte into uint8
+     - On forward: dequantize on the fly (true ~0.5B/param storage)
 
-NF4 exploits the empirical fact that pretrained weights are approximately
-normally distributed: its 16 levels are the expected values of 16 equal-probability
-bins under N(0,1), which minimizes expected quantization error for Gaussian data.
+  2. NF4 (Normal Float 4-bit) — levels placed at normal-distribution
+     quantiles. Recovers more accuracy than absmax for Gaussian weights.
+
+Both schemes store one fp32 scale per block of 64 weights.
 """
+
+from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 
-# ============================================================
-# NF4 lookup table — the 16 levels from the QLoRA paper
-# These are the expected values of 16 equal-probability bins
-# under a standard normal distribution, normalized to [-1, 1].
-# ============================================================
+# ------------------------------------------------------------------ #
+#  NF4 lookup table (computed once at import)
+# ------------------------------------------------------------------ #
+
 def _compute_nf4_levels() -> torch.Tensor:
-    """
-    Compute the 16 NF4 quantization levels.
-    
-    For a standard normal, divide the CDF into 2^4 = 16 equal-probability bins.
-    The representative value for each bin is E[X | X in bin], normalized to [-1, 1].
-    
-    One level is fixed at 0.0 for exact zero representation (important for
-    sparse weights and zero-initialized parameters).
-    """
-    from scipy.stats import norm
-
-    n_levels = 16
-    # 15 non-zero levels + 1 zero level
-    # Compute quantiles for 15 levels (excluding zero)
-    n_positive = 8  # 8 positive levels
-    n_negative = 7  # 7 negative levels (the 16th slot is zero)
-
-    # Negative levels: quantiles of the negative half
-    neg_quantiles = np.linspace(0, 0.5, n_negative + 1)
-    neg_levels = []
-    for i in range(n_negative):
-        # Expected value in the bin [q_i, q_{i+1}]
-        lo, hi = norm.ppf(neg_quantiles[i] + 1e-10), norm.ppf(neg_quantiles[i + 1])
-        # E[X | lo < X < hi] using truncated normal formula
-        level = (norm.pdf(lo) - norm.pdf(hi)) / (norm.cdf(hi) - norm.cdf(lo) + 1e-10)
-        neg_levels.append(-abs(level))
-
-    # Positive levels: mirror of negative
-    pos_quantiles = np.linspace(0.5, 1.0, n_positive + 1)
-    pos_levels = []
-    for i in range(n_positive):
-        lo, hi = norm.ppf(pos_quantiles[i]), norm.ppf(pos_quantiles[i + 1] - 1e-10)
-        level = (norm.pdf(lo) - norm.pdf(hi)) / (norm.cdf(hi) - norm.cdf(lo) + 1e-10)
-        pos_levels.append(abs(level))
-
-    levels = sorted(neg_levels) + [0.0] + sorted(pos_levels)
-    # Normalize to [-1, 1]
-    levels = np.array(levels)
-    levels = levels / np.max(np.abs(levels))
-    return torch.tensor(levels, dtype=torch.float32)
+    """16 levels placed at normal-distribution quantile midpoints, normalised to [-1,1]."""
+    try:
+        from scipy.stats import norm
+        n_neg, n_pos = 7, 8
+        neg_q = np.linspace(0, 0.5, n_neg + 1)
+        pos_q = np.linspace(0.5, 1.0, n_pos + 1)
+        levels = []
+        for lo, hi in zip(neg_q[:-1], neg_q[1:]):
+            lo_v, hi_v = norm.ppf(lo + 1e-9), norm.ppf(hi)
+            mid = (norm.pdf(lo_v) - norm.pdf(hi_v)) / max(norm.cdf(hi_v) - norm.cdf(lo_v), 1e-9)
+            levels.append(-abs(mid))
+        levels.append(0.0)
+        for lo, hi in zip(pos_q[:-1], pos_q[1:]):
+            lo_v, hi_v = norm.ppf(lo), norm.ppf(hi - 1e-9)
+            mid = (norm.pdf(lo_v) - norm.pdf(hi_v)) / max(norm.cdf(hi_v) - norm.cdf(lo_v), 1e-9)
+            levels.append(abs(mid))
+        arr = np.array(sorted(levels))
+        arr /= max(abs(arr.max()), abs(arr.min()))
+        return torch.tensor(arr, dtype=torch.float32)
+    except ImportError:
+        # Pre-computed fallback
+        return torch.tensor([
+            -1.0000, -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911, 0.0000,
+             0.0796,  0.1609,  0.2461,  0.3379,  0.4407,  0.5626,  0.7230,  1.0000,
+        ])
 
 
-# Pre-compute once at import time
-try:
-    NF4_LEVELS = _compute_nf4_levels()
-except ImportError:
-    # Fallback if scipy not available — use pre-computed values
-    NF4_LEVELS = torch.tensor([
-        -1.0000, -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911, 0.0000,
-         0.0796,  0.1609,  0.2461,  0.3379,  0.4407,  0.5626,  0.7230,  1.0000
-    ])
+NF4_LEVELS = _compute_nf4_levels()
 
 
-# ============================================================
-# Scheme 1: Block-wise Absmax (baseline)
-# ============================================================
+# ------------------------------------------------------------------ #
+#  Scheme 1: Block-wise Absmax with real nibble packing
+# ------------------------------------------------------------------ #
 
 def quantize_absmax_4bit(weight: torch.Tensor, block_size: int = 64):
     """
-    Block-wise absmax 4-bit quantization.
-    
-    Chops the weight into blocks, finds the max absolute value per block,
-    and rounds each weight to one of 16 symmetric levels.
-    
-    Args:
-        weight: The tensor to quantize.
-        block_size: Number of elements per quantization block.
-    
+    Pack weight into 4-bit nibbles (two values per uint8 byte).
+
+    Signed symmetric quantization: each value mapped to [-7, 7],
+    stored as nibble offset [1, 15] to avoid the zero nibble as sentinel.
+
     Returns:
-        Tuple of (quantized_int8, scales, padding, original_shape).
+        packed   : uint8 tensor, shape [ceil(numel/2)]
+        scales   : fp32 per-block scale, shape [n_blocks]
+        pad      : number of zero-padding elements added
+        shape    : original weight shape
     """
-    flat = weight.detach().flatten().float()
+    flat = weight.detach().to(torch.float32).contiguous().view(-1)
     pad = (-flat.numel()) % block_size
     if pad:
-        flat = torch.cat([flat, torch.zeros(pad)])
+        flat = F.pad(flat, (0, pad))
 
     blocks = flat.view(-1, block_size)
-    scales = blocks.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+    scales = blocks.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / 7.0  # per-block scale
+    quantized = torch.round(blocks / scales).clamp(-7, 7).to(torch.int16).view(-1)
 
-    # Quantize to [-8, 7] (4-bit signed range)
-    q = torch.round(blocks / scales * 7).clamp(-8, 7).to(torch.int8)
+    # Encode: shift [-7,7] -> [1,15] so nibble 0 is never a data value
+    encoded = (quantized + 8).to(torch.uint8)
+    if encoded.numel() % 2:
+        encoded = F.pad(encoded, (0, 1))
 
-    return q, scales, pad, weight.shape
+    # Pack two 4-bit values per byte
+    packed = encoded[0::2] | (encoded[1::2] << 4)
+    return packed.contiguous(), scales.view(-1).contiguous(), pad, tuple(weight.shape)
 
 
-def dequantize_absmax(q, scales, pad, shape):
-    """Dequantize absmax 4-bit back to float."""
-    out = (q.float() / 7 * scales).flatten()
+def dequantize_absmax(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    pad: int,
+    shape: tuple,
+    block_size: int = 64,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Unpack nibbles and rescale back to float."""
+    low  = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    encoded = torch.stack((low, high), dim=1).reshape(-1).to(torch.int16)
+    signed = (encoded - 8).to(torch.float32)
+
+    padded_count = math.ceil(math.prod(shape) / block_size) * block_size
+    signed = signed[:padded_count].view(-1, block_size)
+    restored = (signed * scales.to(torch.float32).view(-1, 1)).reshape(-1)
     if pad:
-        out = out[: out.numel() - pad]
-    return out.view(shape)
+        restored = restored[:-pad]
+    return restored.view(shape).to(dtype=dtype)
 
 
-# ============================================================
-# Scheme 2: NF4 (Normal Float 4-bit) — INNOVATION
-# ============================================================
+# ------------------------------------------------------------------ #
+#  Scheme 2: NF4 — Normal Float 4-bit (Innovation)
+# ------------------------------------------------------------------ #
 
 def quantize_nf4(weight: torch.Tensor, block_size: int = 64):
     """
-    NF4 quantization: map each weight to the nearest NF4 level after block normalization.
-    
-    This exploits the empirical observation that pretrained neural network weights
-    are approximately normally distributed. The NF4 levels are optimal for this case.
-    
-    Args:
-        weight: Tensor to quantize.
-        block_size: Block size for per-block scaling.
-    
-    Returns:
-        Tuple of (quantized_indices_uint8, scales, padding, original_shape, nf4_levels).
+    Map each weight to the nearest of 16 NF4 levels after per-block normalisation.
+    NF4 levels are optimal for normally-distributed weights (as pretrained LLMs have).
+    Returns indices as uint8 (values 0-15).
     """
     levels = NF4_LEVELS.to(weight.device)
-
-    flat = weight.detach().flatten().float()
+    flat = weight.detach().float().contiguous().view(-1)
     pad = (-flat.numel()) % block_size
     if pad:
-        flat = torch.cat([flat, flat.new_zeros(pad)])
+        flat = F.pad(flat, (0, pad))
 
     blocks = flat.view(-1, block_size)
-    scales = blocks.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+    scales = blocks.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
+    normalised = blocks / scales  # each block normalised to [-1, 1]
 
-    # Normalize to [-1, 1] per block
-    normalized = blocks / scales
-
-    # Find nearest NF4 level for each weight (vectorized)
-    # Shape: [n_blocks, block_size, 1] vs [1, 1, 16]
-    distances = (normalized.unsqueeze(-1) - levels.view(1, 1, -1)).abs()
-    indices = distances.argmin(dim=-1).to(torch.uint8)  # [n_blocks, block_size]
-
-    return indices, scales, pad, weight.shape, levels
+    # Nearest NF4 level (vectorised)
+    distances = (normalised.unsqueeze(-1) - levels.view(1, 1, -1)).abs()
+    indices = distances.argmin(dim=-1).to(torch.uint8)
+    return indices.contiguous(), scales.view(-1).contiguous(), pad, tuple(weight.shape), levels
 
 
-def dequantize_nf4(indices, scales, pad, shape, levels):
-    """Dequantize NF4 back to float using the level lookup table."""
+def dequantize_nf4(
+    indices: torch.Tensor,
+    scales: torch.Tensor,
+    pad: int,
+    shape: tuple,
+    levels: torch.Tensor,
+) -> torch.Tensor:
+    """Look up NF4 levels and rescale."""
     levels = levels.to(scales.device)
-    # Look up the float value for each index
-    dequantized = levels[indices.long()] * scales  # [n_blocks, block_size]
-    out = dequantized.flatten()
+    dequantised = levels[indices.long()] * scales.view(-1, 1)
+    out = dequantised.reshape(-1)
     if pad:
-        out = out[: out.numel() - pad]
+        out = out[:-pad]
     return out.view(shape)
 
 
-# ============================================================
-# Apply quantization to a model
-# ============================================================
+# ------------------------------------------------------------------ #
+#  QuantizedProjection — real 4-bit frozen layer (from lora-forge)
+# ------------------------------------------------------------------ #
 
-def quantize_model_weights(model, scheme: str = "absmax", block_size: int = 64):
+class QuantizedProjection(nn.Module):
     """
-    Quantize all frozen base weights in-place (dequantize and store back).
-    
-    This simulates what QLoRA does: the base is stored at reduced precision,
-    and dequantized on-the-fly during forward passes. Here we do a one-shot
-    dequantize for simplicity (the precision loss is the same).
-    
-    Args:
-        model: Model with or without LoRA wrappers.
-        scheme: 'absmax' or 'nf4'.
-        block_size: Quantization block size.
-    
-    Returns:
-        Tuple of (n_quantized_params, mean_relative_error).
+    Frozen projection whose weight is stored in packed block-wise 4-bit form.
+    Dequantizes on every forward pass. Keeps ~0.5 bytes per weight (vs 4 in fp32).
+    """
+
+    def __init__(self, base: nn.Module, block_size: int = 64, scheme: str = "absmax") -> None:
+        super().__init__()
+        if not hasattr(base, "weight") or base.weight.ndim != 2:
+            raise TypeError("QuantizedProjection expects a module with a 2D weight.")
+        if scheme not in ("absmax", "nf4"):
+            raise ValueError(f"scheme must be 'absmax' or 'nf4', got '{scheme}'")
+
+        self.fan_in_fan_out = type(base).__name__ == "Conv1D" or bool(
+            getattr(base, "fan_in_fan_out", False)
+        )
+        self.block_size = block_size
+        self.scheme = scheme
+        self.weight_shape = tuple(base.weight.shape)
+        self._weight_dtype = base.weight.dtype
+
+        if self.fan_in_fan_out:
+            self.in_features, self.out_features = base.weight.shape
+        else:
+            self.out_features, self.in_features = base.weight.shape
+
+        if scheme == "absmax":
+            packed, scales, pad, shape = quantize_absmax_4bit(base.weight, block_size)
+            self.register_buffer("packed_weight", packed)
+            self.register_buffer("scales", scales)
+            self.pad = int(pad)
+            self.original_shape = shape
+            self._nf4_levels = None
+        else:  # nf4
+            indices, scales, pad, shape, nf4_levels = quantize_nf4(base.weight, block_size)
+            self.register_buffer("packed_weight", indices)
+            self.register_buffer("scales", scales)
+            self.pad = int(pad)
+            self.original_shape = shape
+            self._nf4_levels = nf4_levels
+
+        bias = getattr(base, "bias", None)
+        if bias is None:
+            self.register_buffer("bias", None)
+        else:
+            self.register_buffer("bias", bias.detach().clone())
+
+    def dequantized_weight(self) -> torch.Tensor:
+        if self.scheme == "absmax":
+            return dequantize_absmax(
+                self.packed_weight, self.scales, self.pad,
+                self.original_shape, self.block_size, self._weight_dtype,
+            )
+        else:
+            return dequantize_nf4(
+                self.packed_weight, self.scales, self.pad,
+                self.original_shape, self._nf4_levels,
+            ).to(self._weight_dtype)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        weight = self.dequantized_weight()
+        if self.fan_in_fan_out:
+            weight = weight.transpose(0, 1)
+        return F.linear(inputs, weight, self.bias)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in={self.in_features}, out={self.out_features}, "
+            f"scheme={self.scheme}, block_size={self.block_size}"
+        )
+
+
+# ------------------------------------------------------------------ #
+#  Apply quantization to a full model
+# ------------------------------------------------------------------ #
+
+def quantize_model_weights(
+    model: nn.Module,
+    scheme: str = "absmax",
+    block_size: int = 64,
+) -> tuple[int, float]:
+    """
+    Replace every frozen Conv1D projection with a QuantizedProjection.
+    LoRA A and B parameters are untouched (they stay in fp32).
+
+    Returns (n_quantized_params, mean_relative_error).
     """
     from .core import LoRALinear
-    from transformers.pytorch_utils import Conv1D
+
+    replacements = []
+    for name, module in list(model.named_modules()):
+        if not name:
+            continue
+        # Target Conv1D layers that are either bare or wrapped in LoRALinear
+        if type(module).__name__ == "Conv1D":
+            replacements.append(name)
+        elif isinstance(module, LoRALinear) and type(module.base).__name__ == "Conv1D":
+            replacements.append(name + ".base")
+
+    if not replacements:
+        # Fallback: quantize all Linear layers (for plain nn.Linear models)
+        for name, module in list(model.named_modules()):
+            if isinstance(module, nn.Linear) and not any(
+                isinstance(module, LoRALinear) for _ in [None]
+            ):
+                replacements.append(name)
 
     n_quantized = 0
     errors = []
 
-    with torch.no_grad():
-        for module in model.modules():
-            # Quantize frozen base weights only
-            target = None
-            if isinstance(module, LoRALinear):
-                target = module.base
-            elif isinstance(module, (nn.Linear, Conv1D)):
-                target = module
+    for dotted in replacements:
+        parts = dotted.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        child_name = parts[-1]
+        child = getattr(parent, child_name)
 
-            if target is None:
-                continue
+        if not hasattr(child, "weight"):
+            continue
 
-            w = target.weight.data
-            if scheme == "nf4":
-                dq = dequantize_nf4(*quantize_nf4(w, block_size))
-            else:
-                dq = dequantize_absmax(*quantize_absmax_4bit(w, block_size))
+        # Measure error before replacing
+        orig_w = child.weight.data.float()
+        quant_proj = QuantizedProjection(child, block_size=block_size, scheme=scheme)
+        dq_w = quant_proj.dequantized_weight().float()
+        rel_err = (orig_w - dq_w).abs().mean().item() / (orig_w.abs().mean().item() + 1e-8)
+        errors.append(rel_err)
+        n_quantized += orig_w.numel()
 
-            # Measure error
-            rel_err = (w - dq).abs().mean().item() / (w.abs().mean().item() + 1e-8)
-            errors.append(rel_err)
-
-            target.weight.data = dq
-            n_quantized += w.numel()
+        setattr(parent, child_name, quant_proj)
 
     mean_error = sum(errors) / len(errors) if errors else 0.0
     return n_quantized, mean_error

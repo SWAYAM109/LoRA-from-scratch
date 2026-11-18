@@ -46,6 +46,13 @@ class LoRALinear(nn.Module):
         init_strategy: str = "kaiming",
     ):
         super().__init__()
+        # --- Input validation (from lora-forge) ---
+        if r < 1:
+            raise ValueError("r (rank) must be >= 1")
+        if alpha <= 0:
+            raise ValueError("alpha must be > 0")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
         if init_strategy not in self.VALID_INIT_STRATEGIES:
             raise ValueError(
                 f"init_strategy must be one of {self.VALID_INIT_STRATEGIES}, got '{init_strategy}'"
@@ -59,12 +66,18 @@ class LoRALinear(nn.Module):
         for p in self.base.parameters():
             p.requires_grad = False
 
-        # Detect dimensions (Conv1D stores weight as [d_in, d_out])
-        self._is_conv1d = _is_conv1d(base)
-        if self._is_conv1d:
+        # fan_in_fan_out: True when weight is stored as [d_in, d_out] (GPT-2 Conv1D)
+        self.fan_in_fan_out = _is_conv1d(base)
+        self._is_conv1d = self.fan_in_fan_out  # kept for backward compat
+
+        if self.fan_in_fan_out:
             d_in, d_out = base.weight.shape
-        else:
+        elif hasattr(base, "in_features"):
             d_in, d_out = base.in_features, base.out_features
+        elif hasattr(base, "weight"):
+            d_out, d_in = base.weight.shape
+        else:
+            raise TypeError("base must expose in_features/out_features or a 2D weight")
 
         self.d_in = d_in
         self.d_out = d_out

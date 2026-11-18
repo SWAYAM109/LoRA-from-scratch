@@ -12,9 +12,14 @@ Author: SWAYAM109
 __version__ = "1.0.0"
 
 from .core import LoRALinear
+from .config import AdapterConfig
 from .injection import add_lora, remove_lora
 from .merge import merge_lora, unmerge_lora, swap_adapter
-from .quantization import quantize_absmax_4bit, dequantize_absmax, quantize_nf4, dequantize_nf4
+from .quantization import (
+    quantize_absmax_4bit, dequantize_absmax,
+    quantize_nf4, dequantize_nf4,
+    QuantizedProjection, quantize_model_weights,
+)
 from .data import load_ledgar_task, encode_clause
 from .analysis import (
     count_parameters,

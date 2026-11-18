@@ -198,5 +198,99 @@ class TestQuantization(unittest.TestCase):
         self.assertLessEqual(err_nf4, err_abs + 0.01)
 
 
+class TestAdapterConfig(unittest.TestCase):
+    """Tests for AdapterConfig serialisation."""
+
+    def test_defaults(self):
+        from lora_scratch.config import AdapterConfig
+        cfg = AdapterConfig()
+        self.assertEqual(cfg.rank, 8)
+        self.assertEqual(cfg.alpha, 16.0)
+        self.assertEqual(cfg.quantization, "none")
+
+    def test_save_load_roundtrip(self):
+        import tempfile, os
+        from lora_scratch.config import AdapterConfig
+        cfg = AdapterConfig(rank=16, alpha=32.0, accuracy=0.958, notes="test run")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg.save(tmpdir)
+            loaded = AdapterConfig.load(tmpdir)
+        self.assertEqual(loaded.rank, 16)
+        self.assertAlmostEqual(loaded.alpha, 32.0)
+        self.assertAlmostEqual(loaded.accuracy, 0.958)
+        self.assertEqual(loaded.notes, "test run")
+
+    def test_from_dict_ignores_unknown_keys(self):
+        from lora_scratch.config import AdapterConfig
+        cfg = AdapterConfig.from_dict({"rank": 4, "unknown_key": "ignored"})
+        self.assertEqual(cfg.rank, 4)
+
+    def test_load_missing_file_raises(self):
+        from lora_scratch.config import AdapterConfig
+        with self.assertRaises(FileNotFoundError):
+            AdapterConfig.load("/nonexistent/path")
+
+
+class TestQuantizedProjection(unittest.TestCase):
+    """Tests for real nibble-packed QuantizedProjection."""
+
+    def test_absmax_forward_shape(self):
+        from lora_scratch.quantization import QuantizedProjection
+        base = nn.Linear(64, 128)
+        qp = QuantizedProjection(base, block_size=64, scheme="absmax")
+        x = torch.randn(4, 64)
+        out = qp(x)
+        self.assertEqual(out.shape, (4, 128))
+
+    def test_nf4_forward_shape(self):
+        from lora_scratch.quantization import QuantizedProjection
+        base = nn.Linear(64, 128)
+        qp = QuantizedProjection(base, block_size=64, scheme="nf4")
+        x = torch.randn(4, 64)
+        out = qp(x)
+        self.assertEqual(out.shape, (4, 128))
+
+    def test_packed_storage_smaller(self):
+        """packed_weight should use fewer bytes than fp32 weight."""
+        from lora_scratch.quantization import QuantizedProjection
+        base = nn.Linear(256, 512)
+        qp = QuantizedProjection(base, scheme="absmax")
+        packed_bytes = qp.packed_weight.numel() * qp.packed_weight.element_size()
+        fp32_bytes = base.weight.numel() * 4
+        self.assertLess(packed_bytes, fp32_bytes // 2)
+
+    def test_invalid_scheme_raises(self):
+        from lora_scratch.quantization import QuantizedProjection
+        with self.assertRaises(ValueError):
+            QuantizedProjection(nn.Linear(32, 64), scheme="invalid")
+
+    def test_merge_into_quantized_raises(self):
+        """Merging a LoRA adapter into a quantized base should raise TypeError."""
+        from lora_scratch.quantization import QuantizedProjection
+        from lora_scratch.core import LoRALinear
+        from lora_scratch.merge import _merge_single
+        qp = QuantizedProjection(nn.Linear(32, 64), scheme="absmax")
+        lora = LoRALinear(nn.Linear(32, 64), r=4)
+        # Manually point lora.base to the quantized projection
+        lora.base = qp
+        with self.assertRaises(TypeError):
+            _merge_single(lora)
+
+    def test_lora_rank_validation(self):
+        """Rank < 1 should raise ValueError."""
+        with self.assertRaises(ValueError):
+            LoRALinear(nn.Linear(32, 64), r=0)
+
+    def test_lora_alpha_validation(self):
+        """Alpha <= 0 should raise ValueError."""
+        with self.assertRaises(ValueError):
+            LoRALinear(nn.Linear(32, 64), alpha=-1)
+
+    def test_lora_dropout_validation(self):
+        """Dropout >= 1 should raise ValueError."""
+        with self.assertRaises(ValueError):
+            LoRALinear(nn.Linear(32, 64), dropout=1.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

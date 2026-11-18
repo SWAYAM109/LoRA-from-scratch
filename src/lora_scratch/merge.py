@@ -38,13 +38,24 @@ def merge_lora(model):
 
 def _merge_single(lora_module: LoRALinear):
     """Merge adapter weights into the base weight tensor."""
+    base = lora_module.base
+    # Guard: cannot merge into a quantized base (from lora-forge)
+    if not hasattr(base, "weight") or not isinstance(base.weight, torch.Tensor):
+        raise TypeError(
+            "Cannot merge LoRA into a base layer without a floating-point weight. "
+            "If the base is quantized, dequantize first."
+        )
+    if not base.weight.is_floating_point():
+        raise TypeError(
+            "Cannot merge a LoRA adapter into a non-floating-point weight. "
+            "Merge is only valid on fp16/fp32 base layers."
+        )
     delta = lora_module.effective_delta_w()  # [d_out, d_in]
     with torch.no_grad():
-        if lora_module._is_conv1d:
-            # Conv1D weight is [d_in, d_out], so add delta.T
-            lora_module.base.weight.data += delta.T
+        if lora_module.fan_in_fan_out:
+            base.weight.data += delta.T.to(base.weight.dtype)
         else:
-            lora_module.base.weight.data += delta
+            base.weight.data += delta.to(base.weight.dtype)
 
 
 def unmerge_lora(model):
